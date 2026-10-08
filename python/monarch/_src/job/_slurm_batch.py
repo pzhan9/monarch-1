@@ -41,19 +41,25 @@ _WORKER_BOOTSTRAP: str = (
 )
 
 
-def _worker_bootstrap(port: int, bind_to: Optional[str]) -> str:
+def _worker_bootstrap(
+    port: int, bind_to: Optional[str], setup: Optional[str] = None
+) -> str:
     address = f"tcp://{{socket.gethostname()}}:{port}"
     if bind_to is not None:
         bind_ip = ipaddress.ip_address(bind_to)
         bind_host = f"[{bind_ip}]" if bind_ip.version == 6 else str(bind_ip)
         address += f"@tcp://{bind_host}:{port}"
-    return _WORKER_BOOTSTRAP % address
+    bootstrap = _WORKER_BOOTSTRAP % address
+    # Setup runs first, before the bootstrap imports monarch. A newline (not
+    # "; ") keeps the bootstrap out of a trailing compound statement.
+    return bootstrap if setup is None else f"{setup}\n{bootstrap}"
 
 
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(prog="monarch._src.job._slurm_batch")
     parser.add_argument("--port", type=int, default=22222)
     parser.add_argument("--bind-to")
+    parser.add_argument("--worker-setup")
     parser.add_argument("client", help="client command to run inside the allocation")
     args = parser.parse_args(argv)
 
@@ -65,7 +71,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             "--ntasks-per-node=1",
             sys.executable,
             "-c",
-            _worker_bootstrap(args.port, args.bind_to),
+            _worker_bootstrap(args.port, args.bind_to, args.worker_setup),
         ]
     )
     try:

@@ -78,6 +78,7 @@ class SlurmJob(JobTrait):
         out_of_cluster: bool = False,
         attach_to: Optional[str] = None,
         bind_to: Optional[str] = None,
+        worker_setup: Optional[str] = None,
     ) -> None:
         """
         Args:
@@ -108,6 +109,16 @@ class SlurmJob(JobTrait):
                       When set, workers advertise their Slurm hostname while
                       binding this address through the ``dial_to@bind_to`` alias
                       format. The bind address uses ``monarch_port``.
+            worker_setup: Optional Python source executed (as ``__main__``) in
+                      every host worker process (one per srun task), before the
+                      worker bootstrap imports monarch. Use it for per-node setup,
+                      e.g. replacing environment variables that srun copied from
+                      the batch host::
+
+                          worker_setup="import os, socket; os.environ['HOSTNAME'] = socket.gethostname()"
+
+                      For larger logic, import and call a module. The code appears
+                      verbatim in the sbatch script, so keep secrets out of it.
         """
         configure(default_transport=ChannelTransport.TcpWithHostname)
         self._meshes = meshes
@@ -136,6 +147,10 @@ class SlurmJob(JobTrait):
             raise ValueError(
                 "bind_to must be an IPv4 or IPv6 address without a port"
             ) from error
+        if worker_setup is not None:
+            # Fail at submit time rather than on every node after queueing.
+            compile(worker_setup, "<worker_setup>", "exec")
+        self._worker_setup = worker_setup
         # Track the single SLURM job ID and all allocated hostnames
         self._slurm_job_id: Optional[str] = None
         self._all_hostnames: List[str] = []
@@ -155,6 +170,8 @@ class SlurmJob(JobTrait):
         self.__dict__.update(state)
         if "_bind_to" not in state:
             self._bind_to = None
+        if "_worker_setup" not in state:
+            self._worker_setup = None
         configure(default_transport=ChannelTransport.TcpWithHostname)
 
     def _resolve_attach_to(self) -> str | None:
@@ -293,8 +310,10 @@ class SlurmJob(JobTrait):
         if client_script is None:
             # Workers only; an external controller attaches and manages the
             # lifetime. Shares worker bootstrap generation with the batch runner.
-            worker_cmd = _worker_bootstrap(self._port, self._bind_to)
-            batch_script += f"\nsrun {self._python_exe} -c '{worker_cmd}'\n"
+            worker_cmd = _worker_bootstrap(
+                self._port, self._bind_to, self._worker_setup
+            )
+            batch_script += f"\nsrun {self._python_exe} -c {shlex.quote(worker_cmd)}\n"
         else:
             # Batch mode: the in-allocation runner seeds the workers, runs the
             # client (MONARCH_BATCH_JOB=1 so its cached BatchJob reconnects to
@@ -304,9 +323,15 @@ class SlurmJob(JobTrait):
                 if self._bind_to is not None
                 else ""
             )
+            setup_arg = (
+                f" {shlex.quote('--worker-setup=' + self._worker_setup)}"
+                if self._worker_setup is not None
+                else ""
+            )
             batch_script += (
                 f"\n{self._python_exe} -m monarch._src.job._slurm_batch "
-                f"--port {self._port}{bind_to_arg} {shlex.quote(client_script)}\n"
+                f"--port {self._port}{bind_to_arg}{setup_arg} "
+                f"{shlex.quote(client_script)}\n"
             )
 
         logger.info(f"Submitting SLURM job with {num_nodes} nodes")
@@ -489,6 +514,7 @@ class SlurmJob(JobTrait):
             and spec._out_of_cluster == self._out_of_cluster
             and spec._attach_to == self._attach_to
             and spec._bind_to == self._bind_to
+            and spec._worker_setup == self._worker_setup
             and self._jobs_active()
         )
 

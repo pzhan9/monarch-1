@@ -7,6 +7,7 @@
 # pyre-unsafe
 
 import json
+import os
 import pickle
 import shlex
 import subprocess
@@ -369,6 +370,72 @@ def test_can_run_compares_bind_to():
     with patch.object(job, "_jobs_active", return_value=True):
         assert job.can_run(_make_job(bind_to="0.0.0.0"))
         assert not job.can_run(_make_job(bind_to="127.0.0.1"))
+
+
+# ---- worker setup ------------------------------------------------------------
+
+# Multi-line setup with single quotes, which the sbatch script must preserve.
+_SETUP = "import os\nos.environ['MONARCH_TEST_FOOBAR'] = 'from-worker-setup'"
+
+
+def test_worker_bootstrap_runs_setup_first(monkeypatch):
+    service_proc_ids = SlurmJob._allocate_service_proc_ids(1)
+    monkeypatch.setenv(
+        SERVICE_PROC_IDS_ENV, serialize_service_proc_ids(service_proc_ids)
+    )
+    monkeypatch.setenv("SLURM_NODEID", "0")
+    monkeypatch.setenv("MONARCH_TEST_FOOBAR", "from-batch-host")
+    seen = {}
+
+    def run_worker(**kwargs):
+        seen["foobar"] = os.environ["MONARCH_TEST_FOOBAR"]
+
+    with patch("monarch.actor.run_worker_loop_forever", side_effect=run_worker):
+        exec(_slurm_batch._worker_bootstrap(22222, None, _SETUP), {})
+
+    assert seen == {"foobar": "from-worker-setup"}
+
+
+def test_sbatch_script_passes_worker_setup(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    expected = _slurm_batch._worker_bootstrap(22222, None, _SETUP)
+
+    # Workers-only: the srun command spans lines when the setup code does.
+    with patch(
+        "monarch._src.job.slurm.subprocess.run", side_effect=_fake_sbatch
+    ) as mock:
+        _make_job(worker_setup=_SETUP).apply()
+    _, srun_args = _submitted_script(mock).split("\nsrun ", 1)
+    assert shlex.split(srun_args) == ["/venv/bin/python", "-c", expected]
+
+    # Batch mode: the runner parses the setup and passes it to srun.
+    with patch(
+        "monarch._src.job.slurm.subprocess.run", side_effect=_fake_sbatch
+    ) as mock:
+        _make_job(worker_setup=_SETUP).apply(client_script="/venv/bin/python train.py")
+    _, runner_args = _submitted_script(mock).split("monarch._src.job._slurm_batch", 1)
+    workers = MagicMock()
+    workers.poll.return_value = 0
+    with (
+        patch(
+            "monarch._src.job._slurm_batch.subprocess.Popen", return_value=workers
+        ) as popen,
+        patch(
+            "monarch._src.job._slurm_batch.subprocess.run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0),
+        ),
+        pytest.raises(SystemExit),
+    ):
+        _slurm_batch.main(shlex.split(runner_args))
+    assert popen.call_args.args[0][-1] == expected
+
+
+def test_can_run_compares_worker_setup():
+    job = _make_job(worker_setup="import os")
+    with patch.object(job, "_jobs_active", return_value=True):
+        assert job.can_run(_make_job(worker_setup="import os"))
+        assert not job.can_run(_make_job(worker_setup="import sys"))
+        assert not job.can_run(_make_job())
 
 
 def test_state_pairs_controller_addresses_with_worker_service_proc_ids():
